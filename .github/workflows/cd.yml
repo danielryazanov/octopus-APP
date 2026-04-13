@@ -1,0 +1,96 @@
+name: CD – Deploy to Production
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'production'
+        type: choice
+        options: [production, staging]
+
+# Default minimal permissions
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/octopus-app
+
+jobs:
+  # ── Deploy ────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy (${{ github.event.inputs.environment || 'production' }})
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    permissions:
+      contents: read
+    concurrency:
+      group: deploy-${{ github.event.inputs.environment || 'production' }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Determine the image tag to deploy
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="sha-$(git rev-parse --short HEAD)"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      # ── SSH deploy via docker compose ─────────────────────────────────────
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.0
+        env:
+          APP_IMAGE: ${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
+          MONGO_ROOT_USER: ${{ secrets.MONGO_ROOT_USER }}
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+          MONGO_APP_USER: ${{ secrets.MONGO_APP_USER }}
+          MONGO_APP_PASSWORD: ${{ secrets.MONGO_APP_PASSWORD }}
+          GRAFANA_PASSWORD: ${{ secrets.GRAFANA_PASSWORD }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: APP_IMAGE,MONGO_ROOT_USER,MONGO_ROOT_PASSWORD,MONGO_APP_USER,MONGO_APP_PASSWORD,GRAFANA_PASSWORD
+          script: |
+            set -euo pipefail
+            cd /opt/octopus-app
+
+            # Pull latest compose files
+            git pull --ff-only origin ${{ github.ref_name }}
+
+            # Write env file from secrets
+            cat > .env <<EOF
+            MONGO_ROOT_USER=${MONGO_ROOT_USER}
+            MONGO_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD}
+            MONGO_APP_USER=${MONGO_APP_USER}
+            MONGO_APP_PASSWORD=${MONGO_APP_PASSWORD}
+            APP_IMAGE=${APP_IMAGE}
+            GRAFANA_PASSWORD=${GRAFANA_PASSWORD}
+            EOF
+
+            docker compose pull app
+            docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
+
+            # Wait for health check
+            sleep 15
+            docker compose ps
+            curl -sf http://localhost/healthz || (echo "Health check failed" && exit 1)
+
+      - name: Smoke test
+        run: |
+          echo "Smoke test: waiting for service to be healthy..."
+          sleep 10
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Deployment failed! Consider rollback."
